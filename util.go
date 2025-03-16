@@ -16,8 +16,10 @@ import (
 
 func removeCacheLock(cacheKey string) {
 	cacheLocksMutex.Lock()
+	defer cacheLocksMutex.Unlock()
+
+	cacheLocks[cacheKey].Unlock()
 	delete(cacheLocks, cacheKey)
-	cacheLocksMutex.Unlock()
 }
 
 // Redact queries to hide tokens
