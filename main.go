@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const version = "v004-03162025-0206p"
+const version = "v004-03162025-0337p"
 
 func main() {
 	log.Println("Starting " + version)
