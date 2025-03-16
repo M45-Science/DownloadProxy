@@ -18,7 +18,9 @@ func removeCacheLock(cacheKey string) {
 	cacheLocksMutex.Lock()
 	defer cacheLocksMutex.Unlock()
 
-	cacheLocks[cacheKey].Unlock()
+	if cacheLocks[cacheKey] != nil {
+		cacheLocks[cacheKey].Unlock()
+	}
 	delete(cacheLocks, cacheKey)
 }
 
