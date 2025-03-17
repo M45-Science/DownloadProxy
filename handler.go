@@ -55,11 +55,14 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if data, err := checkCache(cacheFile); err == nil {
 
 		//Track bandwidth saved
-		bytesBandwidthSaved = bytesBandwidthSaved + uint64(len(data))
+		dataLen := len(data)
+		bytesBandwidthSaved = bytesBandwidthSaved + uint64(dataLen)
 		bytesBandwidthSavedDirty = true
 
 		// Serve from cache
 		log.Println("From Cache: ", cleanedURLPath)
+		//Include content length
+		w.Header().Set("Content-Length", strconv.Itoa(dataLen))
 		w.Write(data)
 		return
 	}
