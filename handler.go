@@ -49,7 +49,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	// Acquire a lock for this cache key to prevent multiple downloads
 	urlCacheLock := getCacheLock(cacheKey)
 	urlCacheLock.Lock()
-	defer removeCacheLock(cacheKey)
+	defer urlCacheLock.Unlock()
+	//defer removeCacheLock(cacheKey)
 
 	// Check if the URL is cached
 	if data, err := checkCache(cacheFile); err == nil {
