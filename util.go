@@ -14,16 +14,6 @@ import (
 	"time"
 )
 
-func removeCacheLock(cacheKey string) {
-	cacheLocksMutex.Lock()
-	defer cacheLocksMutex.Unlock()
-
-	if cacheLocks[cacheKey] != nil {
-		cacheLocks[cacheKey].Unlock()
-	}
-	delete(cacheLocks, cacheKey)
-}
-
 // Redact queries to hide tokens
 func redactQuery(url string) string {
 	parts := strings.Split(url, "?")
@@ -150,7 +140,7 @@ func cleanupShortCache() {
 			//Lock this so we can't delete it while it is in-use
 			urlCacheLock := getCacheLock(info.Name())
 			urlCacheLock.Lock()
-			defer removeCacheLock(info.Name())
+			defer urlCacheLock.Unlock()
 
 			//Lock entire locks map, then delete the file
 			//If we were able to delete the file, remove it from the locks map
@@ -184,7 +174,7 @@ func cleanupLongCache() {
 			//Lock this so we can't delete it while it is in-use
 			urlCacheLock := getCacheLock(info.Name())
 			urlCacheLock.Lock()
-			defer removeCacheLock(info.Name())
+			defer urlCacheLock.Unlock()
 
 			cacheLocksMutex.Lock()
 			defer cacheLocksMutex.Unlock()
