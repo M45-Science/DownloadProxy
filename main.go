@@ -6,9 +6,13 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
-const version = "v004-03162025-0337p"
+const version = "v004-04092025-0606"
+
+var limiter = rate.NewLimiter(4, 1000) // 10 req/sec with burst of 1000
 
 func main() {
 	log.Println("Starting " + version)
@@ -30,7 +34,15 @@ func main() {
 	go startLongCacheCleanup()
 	time.Sleep(time.Second)
 
-	http.HandleFunc("/", handler)
+	http.HandleFunc("/", rateLimitedHandler)
 	log.Println("Starting server on " + port + "...")
 	log.Fatal(http.ListenAndServe(port, nil))
+}
+
+func rateLimitedHandler(w http.ResponseWriter, r *http.Request) {
+	if !limiter.Allow() {
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
+	handler(w, r)
 }
