@@ -1,16 +1,24 @@
 package main
 
 import (
+	"net/http"
 	"sync"
 	"time"
 )
 
 const (
-	shortCacheDir      = "./shortCache/"
-	longCacheDir       = "./longCache/"
-	port               = ":55555"
-	bytesSavedFilename = "saved.txt"
-	cacheSuffix        = ".cache"
+	cacheSuffix     = ".cache"
+	cacheMetaSuffix = ".meta.json"
+
+	defaultShortCacheDir      = "./shortCache/"
+	defaultLongCacheDir       = "./longCache/"
+	defaultBytesSavedFilename = "saved.txt"
+	defaultListenAddr         = "127.0.0.1:55555"
+	defaultUpstreamRate       = time.Second
+	defaultUpstreamBurst      = 1
+	defaultFetchTimeout       = 2 * time.Minute
+	defaultMetricsInterval    = time.Minute
+	cacheFormatVersion        = 1
 
 	shortCacheDuration = time.Minute * 10
 	longCacheDuration  = time.Hour * 24 * 30
@@ -27,10 +35,27 @@ type safeInfo struct {
 	MinValidSize  int
 }
 
+type cacheMetadata struct {
+	Version       int         `json:"version"`
+	Status        int         `json:"status"`
+	Headers       http.Header `json:"headers,omitempty"`
+	ContentLength int64       `json:"content_length,omitempty"`
+}
+
 var (
+	shortCacheDir      = defaultShortCacheDir
+	longCacheDir       = defaultLongCacheDir
+	bytesSavedFilename = defaultBytesSavedFilename
+	listenAddr         = defaultListenAddr
+	upstreamRate       = defaultUpstreamRate
+	upstreamBurst      = defaultUpstreamBurst
+	fetchTimeout       = defaultFetchTimeout
+	metricsInterval    = defaultMetricsInterval
+
 	cacheLocks      = make(map[string]*sync.Mutex)
 	cacheLocksMutex sync.Mutex
 
+	bytesSavedMutex          sync.Mutex
 	bytesBandwidthSaved      uint64
 	bytesBandwidthSavedDirty bool
 

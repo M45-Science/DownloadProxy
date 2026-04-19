@@ -3,9 +3,13 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -31,12 +35,130 @@ func generateCacheKey(url string) string {
 	return hex.EncodeToString(h.Sum(nil)) + cacheSuffix
 }
 
-func checkCache(filename string) ([]byte, error) {
-	return os.ReadFile(filename)
+func cacheMetadataFilename(bodyFilename string) string {
+	return bodyFilename + cacheMetaSuffix
 }
 
-func cacheData(filename string, data []byte) error {
+func cacheLockKey(filename string) string {
+	return strings.TrimSuffix(filename, cacheMetaSuffix)
+}
+
+func openCachedBody(filename string) (*os.File, cacheMetadata, error) {
+	bodyFile, err := os.Open(filename)
+	if err != nil {
+		return nil, cacheMetadata{}, err
+	}
+
+	info, err := bodyFile.Stat()
+	if err != nil {
+		bodyFile.Close()
+		return nil, cacheMetadata{}, err
+	}
+
+	meta, err := readCacheMetadata(cacheMetadataFilename(filename))
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			bodyFile.Close()
+			return nil, cacheMetadata{}, err
+		}
+
+		return bodyFile, cacheMetadata{
+			Version:       0,
+			Status:        http.StatusOK,
+			Headers:       make(http.Header),
+			ContentLength: info.Size(),
+		}, nil
+	}
+
+	if meta.Status == 0 {
+		meta.Status = http.StatusOK
+	}
+	if meta.Headers == nil {
+		meta.Headers = make(http.Header)
+	}
+	if meta.ContentLength <= 0 {
+		meta.ContentLength = info.Size()
+	}
+
+	return bodyFile, meta, nil
+}
+
+func readCacheMetadata(filename string) (cacheMetadata, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return cacheMetadata{}, err
+	}
+
+	var meta cacheMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return cacheMetadata{}, err
+	}
+
+	return meta, nil
+}
+
+func writeCacheMetadata(filename string, meta cacheMetadata) error {
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
 	return os.WriteFile(filename, data, 0644)
+}
+
+func preserveResponseHeaders(headers http.Header, contentLength int64) http.Header {
+	preserved := make(http.Header)
+
+	for _, key := range []string{
+		"Content-Type",
+		"Content-Disposition",
+		"ETag",
+		"Last-Modified",
+		"Cache-Control",
+	} {
+		values := headers.Values(key)
+		for _, value := range values {
+			preserved.Add(key, value)
+		}
+	}
+
+	if contentLength >= 0 {
+		preserved.Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	}
+
+	return preserved
+}
+
+func applyResponseHeaders(w http.ResponseWriter, headers http.Header, contentLength int64) {
+	for key, values := range headers {
+		w.Header().Del(key)
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	if contentLength >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	}
+}
+
+func streamFile(w http.ResponseWriter, file *os.File, statusCode int, headers http.Header, contentLength int64) (int64, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+
+	applyResponseHeaders(w, headers, contentLength)
+	w.WriteHeader(statusCode)
+
+	return io.Copy(w, file)
+}
+
+func streamFileByName(w http.ResponseWriter, filename string, statusCode int, headers http.Header, contentLength int64) (int64, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	return streamFile(w, file, statusCode, headers, contentLength)
 }
 
 func isLocalhost(remoteAddr string) bool {
@@ -61,23 +183,24 @@ func getCacheLock(cacheKey string) *sync.Mutex {
 
 // safeJoin joins base directory and the target path, ensuring it remains within the base directory
 func safeJoin(baseDir, target string) (string, error) {
-	// Join the base directory and target filename
 	joinedPath := filepath.Join(baseDir, target)
 
-	// Get the absolute path
 	absPath, err := filepath.Abs(joinedPath)
 	if err != nil {
 		return "", err
 	}
 
-	// Get the absolute base directory path
 	absBaseDir, err := filepath.Abs(baseDir)
 	if err != nil {
 		return "", err
 	}
 
-	// Ensure that the final path starts with the base directory
-	if !strings.HasPrefix(absPath, absBaseDir) {
+	relPath, err := filepath.Rel(absBaseDir, absPath)
+	if err != nil {
+		return "", err
+	}
+
+	if relPath == ".." || strings.HasPrefix(relPath, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("path is outside of base directory")
 	}
 
@@ -124,12 +247,18 @@ func startLongCacheCleanup() {
 func cleanupShortCache() {
 	writeSavedFile()
 
+	processed := make(map[string]struct{})
 	filepath.Walk(shortCacheDir, func(path string, info os.FileInfo, err error) error {
-		if info.IsDir() {
-			return nil
-		}
 		if err != nil {
 			log.Println("Error accessing shortCache file:", err)
+			return nil
+		}
+		if info == nil || info.IsDir() {
+			return nil
+		}
+
+		lockKey := cacheLockKey(info.Name())
+		if _, done := processed[lockKey]; done {
 			return nil
 		}
 
@@ -138,15 +267,12 @@ func cleanupShortCache() {
 			log.Println("Deleting expired shortCache file:", path)
 
 			//Lock this so we can't delete it while it is in-use
-			urlCacheLock := getCacheLock(info.Name())
+			urlCacheLock := getCacheLock(lockKey)
 			urlCacheLock.Lock()
-			defer urlCacheLock.Unlock()
-
-			//Lock entire locks map, then delete the file
-			//If we were able to delete the file, remove it from the locks map
-			cacheLocksMutex.Lock()
-			defer cacheLocksMutex.Unlock()
-			if err := os.Remove(path); err != nil {
+			processed[lockKey] = struct{}{}
+			err := removeCacheArtifacts(filepath.Join(shortCacheDir, lockKey))
+			urlCacheLock.Unlock()
+			if err != nil {
 				log.Println("Failed to delete shortCache file:", err)
 				return err
 			}
@@ -157,13 +283,19 @@ func cleanupShortCache() {
 
 // cleanupLongCache scans the cache directory and removes expired files
 func cleanupLongCache() {
+	processed := make(map[string]struct{})
 
 	filepath.Walk(longCacheDir, func(path string, info os.FileInfo, err error) error {
-		if info.IsDir() {
-			return nil
-		}
 		if err != nil {
 			log.Println("Error accessing longCache file:", err)
+			return nil
+		}
+		if info == nil || info.IsDir() {
+			return nil
+		}
+
+		lockKey := cacheLockKey(info.Name())
+		if _, done := processed[lockKey]; done {
 			return nil
 		}
 
@@ -172,13 +304,12 @@ func cleanupLongCache() {
 			log.Println("Deleting expired longCache file:", path)
 
 			//Lock this so we can't delete it while it is in-use
-			urlCacheLock := getCacheLock(info.Name())
+			urlCacheLock := getCacheLock(lockKey)
 			urlCacheLock.Lock()
-			defer urlCacheLock.Unlock()
-
-			cacheLocksMutex.Lock()
-			defer cacheLocksMutex.Unlock()
-			if err := os.Remove(path); err != nil {
+			processed[lockKey] = struct{}{}
+			err := removeCacheArtifacts(filepath.Join(longCacheDir, lockKey))
+			urlCacheLock.Unlock()
+			if err != nil {
 				log.Println("Failed to delete longCache file:", err)
 				return err
 			}
@@ -204,9 +335,53 @@ func isAllowedURL(rawURL string) (bool, bool, int) {
 }
 
 func writeSavedFile() {
-	//Write saved.txt if needed
-	if bytesBandwidthSavedDirty {
-		os.WriteFile(bytesSavedFilename, []byte(strconv.FormatUint(bytesBandwidthSaved, 10)), 0644)
+	savedBytes, dirty := snapshotSavedBytes()
+	if dirty {
+		os.WriteFile(bytesSavedFilename, []byte(strconv.FormatUint(savedBytes, 10)), 0644)
+		markSavedBytesFlushed(savedBytes)
+	}
+}
+
+func removeCacheArtifacts(bodyFilename string) error {
+	for _, name := range []string{bodyFilename, cacheMetadataFilename(bodyFilename)} {
+		if err := os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func setSavedBytes(value uint64) {
+	setSavedBytesState(value, false)
+}
+
+func setSavedBytesState(value uint64, dirty bool) {
+	bytesSavedMutex.Lock()
+	defer bytesSavedMutex.Unlock()
+	bytesBandwidthSaved = value
+	bytesBandwidthSavedDirty = dirty
+}
+
+func addSavedBytes(delta uint64) {
+	if delta == 0 {
+		return
+	}
+	bytesSavedMutex.Lock()
+	defer bytesSavedMutex.Unlock()
+	bytesBandwidthSaved += delta
+	bytesBandwidthSavedDirty = true
+}
+
+func snapshotSavedBytes() (uint64, bool) {
+	bytesSavedMutex.Lock()
+	defer bytesSavedMutex.Unlock()
+	return bytesBandwidthSaved, bytesBandwidthSavedDirty
+}
+
+func markSavedBytesFlushed(savedBytes uint64) {
+	bytesSavedMutex.Lock()
+	defer bytesSavedMutex.Unlock()
+	if bytesBandwidthSaved == savedBytes {
 		bytesBandwidthSavedDirty = false
 	}
 }
