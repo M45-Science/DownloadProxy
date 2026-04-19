@@ -705,13 +705,7 @@ func configureTestRuntime(t *testing.T, allowed []safeInfo) func() {
 		upstreamLimiter = oldUpstreamLimiter
 		upstreamClient = oldUpstreamClient
 		aggregateMetrics = oldAggregateMetrics
-		setSavedBytes(oldSavedBytes)
-		if oldSavedBytesDirty {
-			addSavedBytes(0)
-			bytesSavedMutex.Lock()
-			bytesBandwidthSavedDirty = true
-			bytesSavedMutex.Unlock()
-		}
+		setSavedBytesState(oldSavedBytes, oldSavedBytesDirty)
 		cacheLocks = oldCacheLocks
 	}
 }
