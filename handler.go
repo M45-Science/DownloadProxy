@@ -250,12 +250,34 @@ func downloadUpstreamBody(cleanedURLPath, cacheFile string, resp *http.Response,
 }
 
 func commitCacheEntry(tempName, cacheFile string, meta cacheMetadata) error {
-	if err := os.Rename(tempName, cacheFile); err != nil {
+	metaFile := cacheMetadataFilename(cacheFile)
+	metaTempFile, err := os.CreateTemp(filepath.Dir(metaFile), filepath.Base(metaFile)+".tmp-*")
+	if err != nil {
 		return err
 	}
 
-	if err := writeCacheMetadata(cacheMetadataFilename(cacheFile), meta); err != nil {
-		log.Printf("Failed to write cache metadata for %s: %v", cacheFile, err)
+	metaTempName := metaTempFile.Name()
+	if err := metaTempFile.Close(); err != nil {
+		os.Remove(metaTempName)
+		return err
+	}
+
+	if err := writeCacheMetadata(metaTempName, meta); err != nil {
+		os.Remove(metaTempName)
+		return err
+	}
+
+	if err := os.Rename(tempName, cacheFile); err != nil {
+		os.Remove(metaTempName)
+		return err
+	}
+
+	if err := os.Rename(metaTempName, metaFile); err != nil {
+		os.Remove(metaTempName)
+		if removeErr := os.Remove(cacheFile); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			log.Printf("Failed to roll back cache body for %s after metadata error: %v", cacheFile, removeErr)
+		}
+		return err
 	}
 
 	return nil

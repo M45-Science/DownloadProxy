@@ -224,6 +224,29 @@ func TestSavedBytesHelpersAndFlush(t *testing.T) {
 	}
 }
 
+func TestWriteSavedFileRetainsDirtyFlagOnFailure(t *testing.T) {
+	restore := configureTestRuntime(t, []safeInfo{})
+	defer restore()
+
+	oldWriteFile := writeFile
+	writeFile = func(string, []byte, os.FileMode) error {
+		return os.ErrPermission
+	}
+	defer func() {
+		writeFile = oldWriteFile
+	}()
+
+	setSavedBytes(25)
+	addSavedBytes(100)
+
+	writeSavedFile()
+
+	savedBytes, dirty := snapshotSavedBytes()
+	if savedBytes != 125 || !dirty {
+		t.Fatalf("expected saved bytes=125 dirty=true after failed flush, got %d dirty=%v", savedBytes, dirty)
+	}
+}
+
 func TestMalformedCacheMetadataFallsBackToRefetch(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -428,6 +451,52 @@ func TestHeaderAllowlistExcludesUnknownHeadersFromCache(t *testing.T) {
 
 	if got := second.Header().Get("X-Uncached-Test"); got != "" {
 		t.Fatalf("expected unallowlisted header to be dropped, got %q", got)
+	}
+}
+
+func TestMetadataWriteFailureDoesNotLeaveLegacyCacheBody(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte(strings.Repeat("q", 128)))
+	}))
+	defer upstream.Close()
+
+	testURL := upstream.URL + "/download"
+	restore := configureTestRuntime(t, []safeInfo{
+		{URL: strings.TrimPrefix(upstream.URL, "http://") + "/download", MinValidSize: 1},
+	})
+	defer restore()
+	upstreamClient = upstream.Client()
+
+	oldWriteFile := writeFile
+	writeFile = func(name string, data []byte, perm os.FileMode) error {
+		if strings.HasSuffix(name, cacheMetaSuffix) || strings.Contains(name, cacheMetaSuffix+".tmp-") {
+			return os.ErrPermission
+		}
+		return oldWriteFile(name, data, perm)
+	}
+	defer func() {
+		writeFile = oldWriteFile
+	}()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+url.PathEscape(testURL), nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	handler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	cacheFile, err := cacheBodyFilename(testURL, false)
+	if err != nil {
+		t.Fatalf("cacheBodyFilename failed: %v", err)
+	}
+	if _, err := os.Stat(cacheFile); !os.IsNotExist(err) {
+		t.Fatalf("expected no cache body after metadata failure, stat err=%v", err)
+	}
+	if _, err := os.Stat(cacheMetadataFilename(cacheFile)); !os.IsNotExist(err) {
+		t.Fatalf("expected no cache metadata after metadata failure, stat err=%v", err)
 	}
 }
 
@@ -673,7 +742,7 @@ func configureTestRuntime(t *testing.T, allowed []safeInfo) func() {
 	oldFetchTimeout := fetchTimeout
 	oldUpstreamLimiter := upstreamLimiter
 	oldUpstreamClient := upstreamClient
-	oldAggregateMetrics := aggregateMetrics
+	oldAggregateMetrics := snapshotMetricsState()
 	oldCacheLocks := cacheLocks
 	oldSavedBytes, oldSavedBytesDirty := snapshotSavedBytes()
 
@@ -704,9 +773,70 @@ func configureTestRuntime(t *testing.T, allowed []safeInfo) func() {
 		fetchTimeout = oldFetchTimeout
 		upstreamLimiter = oldUpstreamLimiter
 		upstreamClient = oldUpstreamClient
-		aggregateMetrics = oldAggregateMetrics
+		restoreMetricsState(oldAggregateMetrics)
 		setSavedBytesState(oldSavedBytes, oldSavedBytesDirty)
 		cacheLocks = oldCacheLocks
+	}
+}
+
+type metricsSnapshot struct {
+	totalRequests        uint64
+	cacheHits            uint64
+	cacheMisses          uint64
+	upstreamFetches      uint64
+	upstreamStatus2xx    uint64
+	upstreamStatus4xx    uint64
+	upstreamStatus5xx    uint64
+	upstreamStatus429    uint64
+	clientCancels        uint64
+	upstreamTimeouts     uint64
+	throttleWaits        uint64
+	throttleWaitDuration time.Duration
+	bytesDownloaded      uint64
+	bytesServed          uint64
+	bytesSaved           uint64
+}
+
+func snapshotMetricsState() metricsSnapshot {
+	aggregateMetrics.mu.Lock()
+	defer aggregateMetrics.mu.Unlock()
+
+	return metricsSnapshot{
+		totalRequests:        aggregateMetrics.totalRequests,
+		cacheHits:            aggregateMetrics.cacheHits,
+		cacheMisses:          aggregateMetrics.cacheMisses,
+		upstreamFetches:      aggregateMetrics.upstreamFetches,
+		upstreamStatus2xx:    aggregateMetrics.upstreamStatus2xx,
+		upstreamStatus4xx:    aggregateMetrics.upstreamStatus4xx,
+		upstreamStatus5xx:    aggregateMetrics.upstreamStatus5xx,
+		upstreamStatus429:    aggregateMetrics.upstreamStatus429,
+		clientCancels:        aggregateMetrics.clientCancels,
+		upstreamTimeouts:     aggregateMetrics.upstreamTimeouts,
+		throttleWaits:        aggregateMetrics.throttleWaits,
+		throttleWaitDuration: aggregateMetrics.throttleWaitDuration,
+		bytesDownloaded:      aggregateMetrics.bytesDownloaded,
+		bytesServed:          aggregateMetrics.bytesServed,
+		bytesSaved:           aggregateMetrics.bytesSaved,
+	}
+}
+
+func restoreMetricsState(snapshot metricsSnapshot) {
+	aggregateMetrics = metricsState{
+		totalRequests:        snapshot.totalRequests,
+		cacheHits:            snapshot.cacheHits,
+		cacheMisses:          snapshot.cacheMisses,
+		upstreamFetches:      snapshot.upstreamFetches,
+		upstreamStatus2xx:    snapshot.upstreamStatus2xx,
+		upstreamStatus4xx:    snapshot.upstreamStatus4xx,
+		upstreamStatus5xx:    snapshot.upstreamStatus5xx,
+		upstreamStatus429:    snapshot.upstreamStatus429,
+		clientCancels:        snapshot.clientCancels,
+		upstreamTimeouts:     snapshot.upstreamTimeouts,
+		throttleWaits:        snapshot.throttleWaits,
+		throttleWaitDuration: snapshot.throttleWaitDuration,
+		bytesDownloaded:      snapshot.bytesDownloaded,
+		bytesServed:          snapshot.bytesServed,
+		bytesSaved:           snapshot.bytesSaved,
 	}
 }
 

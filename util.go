@@ -18,6 +18,8 @@ import (
 	"time"
 )
 
+var writeFile = os.WriteFile
+
 // Redact queries to hide tokens
 func redactQuery(url string) string {
 	parts := strings.Split(url, "?")
@@ -102,7 +104,7 @@ func writeCacheMetadata(filename string, meta cacheMetadata) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filename, data, 0644)
+	return writeFile(filename, data, 0644)
 }
 
 func preserveResponseHeaders(headers http.Header, contentLength int64) http.Header {
@@ -337,7 +339,10 @@ func isAllowedURL(rawURL string) (bool, bool, int) {
 func writeSavedFile() {
 	savedBytes, dirty := snapshotSavedBytes()
 	if dirty {
-		os.WriteFile(bytesSavedFilename, []byte(strconv.FormatUint(savedBytes, 10)), 0644)
+		if err := writeFile(bytesSavedFilename, []byte(strconv.FormatUint(savedBytes, 10)), 0644); err != nil {
+			log.Printf("Failed to write saved bytes file %s: %v", bytesSavedFilename, err)
+			return
+		}
 		markSavedBytesFlushed(savedBytes)
 	}
 }
