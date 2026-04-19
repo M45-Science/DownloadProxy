@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"sync"
 	"time"
@@ -146,7 +147,7 @@ func (m *metricsState) logSnapshot() {
 	)
 }
 
-func startMetricsReporter() {
+func startMetricsReporter(ctx context.Context) {
 	if metricsInterval <= 0 {
 		return
 	}
@@ -154,8 +155,13 @@ func startMetricsReporter() {
 	ticker := time.NewTicker(metricsInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		aggregateMetrics.logSnapshot()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			aggregateMetrics.logSnapshot()
+		}
 	}
 }
 

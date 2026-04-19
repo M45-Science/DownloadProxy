@@ -62,9 +62,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cacheKey := generateCacheKey(urlPath)
-	urlCacheLock := getCacheLock(cacheKey)
-	urlCacheLock.Lock()
-	defer urlCacheLock.Unlock()
+	lockEntry := acquireCacheLock(cacheKey)
+	lockEntry.mu.Lock()
+	defer func() {
+		lockEntry.mu.Unlock()
+		releaseCacheLock(cacheKey, lockEntry)
+	}()
 
 	if err := serveFromCache(w, cleanedURLPath, cacheFile, &summary); err == nil {
 		return

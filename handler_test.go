@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -606,6 +605,22 @@ func TestCleanupRemovesExpiredBodyAndMetadataAndOrphans(t *testing.T) {
 	}
 }
 
+func TestCacheLockEntriesAreReleased(t *testing.T) {
+	restore := configureTestRuntime(t, []safeInfo{})
+	defer restore()
+
+	entry := acquireCacheLock("abc")
+	entry.mu.Lock()
+	entry.mu.Unlock()
+	releaseCacheLock("abc", entry)
+
+	cacheLocksMutex.Lock()
+	defer cacheLocksMutex.Unlock()
+	if len(cacheLocks) != 0 {
+		t.Fatalf("expected cache lock map to be empty, got %d entries", len(cacheLocks))
+	}
+}
+
 func TestThrottleWaitMetricsIncrease(t *testing.T) {
 	testURL := "http://example.com/download/throttled.zip"
 	restore := configureTestRuntime(t, []safeInfo{
@@ -756,7 +771,7 @@ func configureTestRuntime(t *testing.T, allowed []safeInfo) func() {
 	upstreamClient = newUpstreamClient()
 	aggregateMetrics = metricsState{}
 	setSavedBytes(0)
-	cacheLocks = make(map[string]*sync.Mutex)
+	cacheLocks = make(map[string]*cacheLockEntry)
 
 	if err := os.MkdirAll(shortCacheDir, 0755); err != nil {
 		t.Fatalf("mkdir short cache failed: %v", err)

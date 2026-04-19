@@ -8,7 +8,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -38,8 +40,12 @@ func main() {
 
 	log.Println("Starting " + version)
 
-	os.MkdirAll(shortCacheDir, 0755)
-	os.MkdirAll(longCacheDir, 0755)
+	if err := os.MkdirAll(shortCacheDir, 0755); err != nil {
+		log.Fatalf("create short cache dir %s: %v", shortCacheDir, err)
+	}
+	if err := os.MkdirAll(longCacheDir, 0755); err != nil {
+		log.Fatalf("create long cache dir %s: %v", longCacheDir, err)
+	}
 
 	//Read in bandwidthSaved
 	data, err := os.ReadFile(bytesSavedFilename)
@@ -51,14 +57,38 @@ func main() {
 		}
 	}
 
-	go startShortCacheCleanup()
-	go startLongCacheCleanup()
-	go startMetricsReporter()
-	time.Sleep(time.Second)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	http.HandleFunc("/", rateLimitedHandler)
+	go startShortCacheCleanup(ctx)
+	go startLongCacheCleanup(ctx)
+	go startMetricsReporter(ctx)
+	go startSavedBytesFlusher(ctx)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", rateLimitedHandler)
+	server := &http.Server{
+		Addr:    listenAddr,
+		Handler: mux,
+	}
+
 	log.Println("Starting server on " + listenAddr + "...")
-	log.Fatal(http.ListenAndServe(listenAddr, nil))
+	go func() {
+		<-ctx.Done()
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP shutdown error: %v", err)
+		}
+	}()
+
+	err = server.ListenAndServe()
+	writeSavedFile()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
 }
 
 func rateLimitedHandler(w http.ResponseWriter, r *http.Request) {

@@ -27,6 +27,7 @@ const (
 	minCacheSize              = 100
 	shortCacheCleanupInterval = time.Minute
 	longCacheCleanupInterval  = time.Hour
+	savedBytesFlushInterval   = 30 * time.Second
 )
 
 type safeInfo struct {
@@ -52,7 +53,7 @@ var (
 	fetchTimeout       = defaultFetchTimeout
 	metricsInterval    = defaultMetricsInterval
 
-	cacheLocks      = make(map[string]*sync.Mutex)
+	cacheLocks      = make(map[string]*cacheLockEntry)
 	cacheLocksMutex sync.Mutex
 
 	bytesSavedMutex          sync.Mutex
@@ -72,3 +73,8 @@ var (
 		{URL: "mods.factorio.com/api/mods", MinValidSize: 500},
 	}
 )
+
+type cacheLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}

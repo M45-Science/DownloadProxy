@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -171,16 +171,40 @@ func isLocalhost(remoteAddr string) bool {
 	return host == "127.0.0.1" || host == "::1" || host == "localhost"
 }
 
-// getCacheLock returns a mutex lock for a specific cache key to prevent concurrent downloads
-func getCacheLock(cacheKey string) *sync.Mutex {
+// acquireCacheLock returns a lock entry for a specific cache key and tracks active users.
+func acquireCacheLock(cacheKey string) *cacheLockEntry {
 	cacheLocksMutex.Lock()
 	defer cacheLocksMutex.Unlock()
 
-	if _, exists := cacheLocks[cacheKey]; !exists {
-		cacheLocks[cacheKey] = &sync.Mutex{}
+	entry, exists := cacheLocks[cacheKey]
+	if !exists {
+		entry = &cacheLockEntry{}
+		cacheLocks[cacheKey] = entry
+	}
+	entry.refs++
+
+	return entry
+}
+
+func releaseCacheLock(cacheKey string, entry *cacheLockEntry) {
+	if entry == nil {
+		return
 	}
 
-	return cacheLocks[cacheKey]
+	cacheLocksMutex.Lock()
+	defer cacheLocksMutex.Unlock()
+
+	current, exists := cacheLocks[cacheKey]
+	if !exists || current != entry {
+		return
+	}
+
+	if entry.refs > 0 {
+		entry.refs--
+	}
+	if entry.refs == 0 {
+		delete(cacheLocks, cacheKey)
+	}
 }
 
 // safeJoin joins base directory and the target path, ensuring it remains within the base directory
@@ -210,38 +234,55 @@ func safeJoin(baseDir, target string) (string, error) {
 }
 
 // startShortCacheCleanup runs a background task that periodically cleans up expired cache files
-func startShortCacheCleanup() {
+func startShortCacheCleanup(ctx context.Context) {
 
 	log.Println("Running initial shortCache cleanup...")
 	cleanupShortCache()
 
-	// Start the ticker for periodic cleanup
 	ticker := time.NewTicker(shortCacheCleanupInterval)
 	defer ticker.Stop()
 
 	for {
-		<-ticker.C
-		//log.Println("Running periodic shortCache cleanup...")
-
-		cleanupShortCache()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleanupShortCache()
+		}
 	}
 }
 
 // startShortCacheCleanup runs a background task that periodically cleans up expired cache files
-func startLongCacheCleanup() {
+func startLongCacheCleanup(ctx context.Context) {
 
 	log.Println("Running initial longCache cleanup...")
 	cleanupLongCache()
 
-	// Start the ticker for periodic cleanup
 	ticker := time.NewTicker(longCacheCleanupInterval)
 	defer ticker.Stop()
 
 	for {
-		<-ticker.C
-		//log.Println("Running periodic longCache cleanup...")
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleanupLongCache()
+		}
+	}
+}
 
-		cleanupLongCache()
+func startSavedBytesFlusher(ctx context.Context) {
+	ticker := time.NewTicker(savedBytesFlushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			writeSavedFile()
+			return
+		case <-ticker.C:
+			writeSavedFile()
+		}
 	}
 }
 
@@ -269,11 +310,12 @@ func cleanupShortCache() {
 			log.Println("Deleting expired shortCache file:", path)
 
 			//Lock this so we can't delete it while it is in-use
-			urlCacheLock := getCacheLock(lockKey)
-			urlCacheLock.Lock()
+			lockEntry := acquireCacheLock(lockKey)
+			lockEntry.mu.Lock()
 			processed[lockKey] = struct{}{}
 			err := removeCacheArtifacts(filepath.Join(shortCacheDir, lockKey))
-			urlCacheLock.Unlock()
+			lockEntry.mu.Unlock()
+			releaseCacheLock(lockKey, lockEntry)
 			if err != nil {
 				log.Println("Failed to delete shortCache file:", err)
 				return err
@@ -306,11 +348,12 @@ func cleanupLongCache() {
 			log.Println("Deleting expired longCache file:", path)
 
 			//Lock this so we can't delete it while it is in-use
-			urlCacheLock := getCacheLock(lockKey)
-			urlCacheLock.Lock()
+			lockEntry := acquireCacheLock(lockKey)
+			lockEntry.mu.Lock()
 			processed[lockKey] = struct{}{}
 			err := removeCacheArtifacts(filepath.Join(longCacheDir, lockKey))
-			urlCacheLock.Unlock()
+			lockEntry.mu.Unlock()
+			releaseCacheLock(lockKey, lockEntry)
 			if err != nil {
 				log.Println("Failed to delete longCache file:", err)
 				return err
