@@ -16,7 +16,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-const version = "v005-04182026-1046p"
+const version = "v006-11092026-1038a"
 
 var (
 	limiter = rate.NewLimiter(4, 1000) // inbound requests
